@@ -1355,4 +1355,484 @@ void CPU::handleException(ExceptionCode code, uint64_t badvaddr = 0) {
 // CP0 storage in CPU
 std::unique_ptr<CP0> CPU::cp0 = nullptr;
 
-// (paste here code in Part 14)
+// -----------------------------------------------------------
+// CPU Core - State Serialization, Debug Utilities
+// (Part 14)
+// -----------------------------------------------------------
+
+#include <fstream>
+#include <string>
+
+// Simple CPU state snapshot (very small subset)
+struct CPUStateSnapshot {
+    uint64_t pc;
+    uint64_t gpr[32];
+    uint64_t hi;
+    uint64_t lo;
+};
+
+// Save minimal CPU state to a file (binary)
+bool CPU::saveState(const std::string &path) const {
+    CPUStateSnapshot snap;
+    snap.pc = PC;
+    for (int i = 0; i < 32; ++i) snap.gpr[i] = GPR[i];
+    snap.hi = HI;
+    snap.lo = LO;
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[STATE] Failed to open snapshot file for writing: " << path << "\n";
+        return false;
+    }
+    f.write(reinterpret_cast<const char*>(&snap), sizeof(snap));
+    std::cout << "[STATE] Saved CPU snapshot to " << path << "\n";
+    return true;
+}
+
+// Load minimal CPU state from file (binary)
+bool CPU::loadState(const std::string &path) {
+    CPUStateSnapshot snap;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[STATE] Failed to open snapshot file for reading: " << path << "\n";
+        return false;
+    }
+    f.read(reinterpret_cast<char*>(&snap), sizeof(snap));
+    if (!f) {
+        std::cerr << "[STATE] Failed to read full snapshot from " << path << "\n";
+        return false;
+    }
+    PC = snap.pc;
+    for (int i = 0; i < 32; ++i) GPR[i] = snap.gpr[i];
+    HI = snap.hi;
+    LO = snap.lo;
+    std::cout << "[STATE] Restored CPU snapshot from " << path << "\n";
+    return true;
+}
+
+// Scoped trace guard: enables trace for lifetime of object, then restores previous state
+class ScopedTrace {
+public:
+    ScopedTrace(bool enable) {
+        prev = traceEnabled;
+        CPU::enableGlobalTrace(enable);
+    }
+    ~ScopedTrace() {
+        CPU::enableGlobalTrace(prev);
+    }
+private:
+    bool prev;
+};
+
+// Global enabling/disabling trace (affects all CPU instances if using static trace flag)
+void CPU::enableGlobalTrace(bool enable) {
+    traceEnabled = enable;
+    std::cout << "[TRACE] Global trace " << (enable ? "ENABLED" : "DISABLED") << "\n";
+}
+
+// Sanity check helper (ensure CPU has required attachments)
+void CPU::sanityCheck() const {
+    if (!mmu) {
+        std::cerr << "[SANITY] Warning: MMU not attached. Translations will be identity.\n";
+    }
+    if (!uart && traceEnabled) {
+        std::cerr << "[SANITY] Note: UART not attached; PROM console output will be lost.\n";
+    }
+    if (!memory.isInitialized()) {
+        std::cerr << "[SANITY] Warning: Memory subsystem not fully initialized.\n";
+    }
+}
+
+// Small utility to print current program counter and nearby instructions (for debugging)
+void CPU::dumpAroundPC(int before, int after) const {
+    uint32_t start = static_cast<uint32_t>(PC) - (before * 4);
+    for (int i = -before; i <= after; ++i) {
+        uint32_t addr = static_cast<uint32_t>(PC) + i * 4;
+        uint32_t instr = 0;
+        try {
+            instr = memory.read32(addr);
+        } catch (...) {
+            instr = 0xffffffff;
+        }
+        std::cout << (i == 0 ? "-> " : "   ")
+                  << std::hex << addr << ": " << std::setw(8) << instr << std::dec << "\n";
+    }
+}
+
+// End of Part 14 - continue in Part 15
+// -----------------------------------------------------------
+// CPU Core - Device Bus, Boot Entry, and Integration Hooks
+// (Part 15)
+// -----------------------------------------------------------
+
+#include "bus.hpp"
+#include "prom.hpp"
+#include "uart.hpp"
+
+// Attach device bus (for IO and memory access mapping)
+void CPU::attachBus(Bus* busPtr) {
+    bus = busPtr;
+    if (bus)
+        std::cout << "[CPU] Attached system bus.\n";
+    else
+        std::cerr << "[CPU] Detached system bus (NULL assigned).\n";
+}
+
+// Attach UART console device
+void CPU::attachUART(UART* uartPtr) {
+    uart = uartPtr;
+    if (uart)
+        std::cout << "[CPU] UART console attached.\n";
+    else
+        std::cerr << "[CPU] UART console detached (NULL assigned).\n";
+}
+
+// Attach PROM (boot ROM)
+void CPU::attachPROM(PROM* promPtr) {
+    prom = promPtr;
+    if (prom)
+        std::cout << "[CPU] PROM attached (revision " << prom->getRevision() << ").\n";
+    else
+        std::cerr << "[CPU] PROM detached.\n";
+}
+
+// Set reset vector (default 0x1FC00000 for SGI IP30)
+void CPU::setResetVector(uint64_t vec) {
+    resetVector = vec;
+}
+
+// Perform a full boot sequence up to PROM entry point
+void CPU::boot() {
+    sanityCheck();
+    std::cout << "[BOOT] Booting from PROM at 0x" << std::hex << resetVector << std::dec << "...\n";
+
+    if (!prom) {
+        std::cerr << "[BOOT] No PROM attached. Cannot continue boot.\n";
+        halted = true;
+        return;
+    }
+
+    // Load first few instructions from PROM
+    PC = resetVector;
+    NPC = PC + 4;
+    halted = false;
+
+    // Simulate PROM console message if UART is connected
+    if (uart) {
+        uart->writeString("Speedracer PROM Boot: Starting execution...\n");
+    }
+
+    // Execute a small number of steps before halting (placeholder)
+    for (int i = 0; i < 8 && !halted; ++i) {
+        step();
+    }
+
+    std::cout << "[BOOT] PROM boot stub finished.\n";
+}
+
+// Run until halt or maxCycles reached
+void CPU::runUntilHalt(uint64_t maxCycles) {
+    std::cout << "[CPU] Running until halt (limit=" << maxCycles << ")...\n";
+    uint64_t count = 0;
+    while (!halted && count < maxCycles) {
+        step();
+        ++count;
+    }
+    std::cout << "[CPU] Execution stopped after " << count << " cycles.\n";
+}
+
+// Soft stop (requested externally)
+void CPU::requestHalt(const std::string &reason) {
+    std::cout << "[HALT] " << reason << "\n";
+    halted = true;
+}
+
+// Reset CPU and jump to reset vector
+void CPU::hardReset() {
+    reset();
+    PC = resetVector;
+    NPC = PC + 4;
+    halted = false;
+    std::cout << "[RESET] Hard reset complete. PC=0x" << std::hex << PC << std::dec << "\n";
+}
+
+// Verify CPU connections before starting
+bool CPU::verifyConnections() const {
+    return (bus && memory.isInitialized() && prom);
+}
+
+// Log minimal system summary
+void CPU::printSummary() const {
+    std::cout << "--------------------------------------------\n";
+    std::cout << " Speedracer Emulator - SGI Octane1 (IP30)\n";
+    std::cout << " CPU Type: MIPS R10000 Compatible\n";
+    std::cout << " PROM: " << (prom ? prom->getRevision() : "none") << "\n";
+    std::cout << " Bus: " << (bus ? "connected" : "not connected") << "\n";
+    std::cout << " Memory: " << (memory.isInitialized() ? "initialized" : "missing") << "\n";
+    std::cout << "--------------------------------------------\n";
+}
+
+// End of Part 15 - continue in Part 16
+// -----------------------------------------------------------
+// CPU Core - Cycle Timing and Cache Hooks
+// (Part 16)
+// -----------------------------------------------------------
+
+#include <chrono>
+
+// -----------------------------------------------------------
+// Cycle Counter & Timing Simulation
+// -----------------------------------------------------------
+
+void CPU::resetCycleCounter() {
+    cycleCounter = 0;
+    startTime = std::chrono::steady_clock::now();
+}
+
+void CPU::tick(uint64_t cycles) {
+    cycleCounter += cycles;
+    if (cycleCounter % 1000000 == 0) {
+        auto now = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = now - startTime;
+        double mhz = (cycleCounter / 1'000'000.0) / elapsed.count();
+        std::cout << "[TIMER] " << cycleCounter << " cycles executed (" 
+                  << mhz << " MHz simulated)\n";
+    }
+}
+
+uint64_t CPU::getCycleCount() const {
+    return cycleCounter;
+}
+
+// -----------------------------------------------------------
+// Cache Subsystem (Simplified Placeholder)
+// -----------------------------------------------------------
+
+struct CacheLine {
+    uint64_t tag = 0;
+    bool valid = false;
+    uint8_t data[64];
+};
+
+class SimpleCache {
+public:
+    SimpleCache(std::string name, size_t lines)
+        : cacheName(std::move(name)), cacheLines(lines) {
+        table.resize(lines);
+    }
+
+    bool fetch(uint64_t addr, uint8_t* buffer) {
+        size_t index = (addr >> 6) % table.size();
+        auto &line = table[index];
+        if (line.valid && ((line.tag << 6) == (addr & ~0x3F))) {
+            std::memcpy(buffer, line.data, 64);
+            return true;
+        }
+        return false;
+    }
+
+    void store(uint64_t addr, const uint8_t* buffer) {
+        size_t index = (addr >> 6) % table.size();
+        auto &line = table[index];
+        line.tag = (addr >> 6);
+        line.valid = true;
+        std::memcpy(line.data, buffer, 64);
+    }
+
+    void invalidateAll() {
+        for (auto &l : table) l.valid = false;
+    }
+
+    void printStats() const {
+        std::cout << "[" << cacheName << "] "
+                  << table.size() << " lines total.\n";
+    }
+
+private:
+    std::string cacheName;
+    size_t cacheLines;
+    std::vector<CacheLine> table;
+};
+
+// -----------------------------------------------------------
+// Integration of Cache into CPU
+// -----------------------------------------------------------
+
+void CPU::initCaches() {
+    icache = std::make_unique<SimpleCache>("ICache", 512);
+    dcache = std::make_unique<SimpleCache>("DCache", 512);
+    std::cout << "[CACHE] Instruction and Data caches initialized.\n";
+}
+
+void CPU::flushCaches() {
+    if (icache) icache->invalidateAll();
+    if (dcache) dcache->invalidateAll();
+    std::cout << "[CACHE] All caches invalidated.\n";
+}
+
+void CPU::dumpCacheInfo() const {
+    if (icache) icache->printStats();
+    if (dcache) dcache->printStats();
+}
+
+// -----------------------------------------------------------
+// Hooks for Cache Access in Load/Store
+// -----------------------------------------------------------
+
+bool CPU::tryICache(uint64_t addr, uint32_t &instr) {
+    if (!icache) return false;
+    uint8_t buf[64];
+    if (!icache->fetch(addr, buf)) return false;
+    std::memcpy(&instr, buf + (addr & 0x3C), sizeof(uint32_t));
+    return true;
+}
+
+void CPU::updateICache(uint64_t addr, uint32_t instr) {
+    if (!icache) return;
+    uint8_t buf[64];
+    std::memcpy(buf + (addr & 0x3C), &instr, sizeof(uint32_t));
+    icache->store(addr, buf);
+}
+
+bool CPU::tryDCacheRead(uint64_t addr, uint64_t &value) {
+    if (!dcache) return false;
+    uint8_t buf[64];
+    if (!dcache->fetch(addr, buf)) return false;
+    std::memcpy(&value, buf + (addr & 0x38), sizeof(uint64_t));
+    return true;
+}
+
+void CPU::updateDCacheWrite(uint64_t addr, uint64_t value) {
+    if (!dcache) return;
+    uint8_t buf[64];
+    std::memcpy(buf + (addr & 0x38), &value, sizeof(uint64_t));
+    dcache->store(addr, buf);
+}
+
+// End of Part 16 - continue in Part 17
+// -----------------------------------------------------------
+// CPU Core - TLB (Translation Lookaside Buffer)
+// (Part 17)
+// -----------------------------------------------------------
+
+#include <array>
+#include <optional>
+
+struct TLBEntry {
+    uint64_t vaddr;
+    uint64_t paddr;
+    uint64_t mask;
+    bool valid;
+    bool dirty;
+    bool global;
+    bool write;
+    bool cacheable;
+};
+
+class TLB {
+public:
+    TLB(size_t entries = 48) : table(entries) {}
+
+    std::optional<uint64_t> translate(uint64_t vaddr, bool writeAccess) {
+        for (const auto& entry : table) {
+            if (!entry.valid) continue;
+
+            uint64_t maskedVAddr = vaddr & ~entry.mask;
+            uint64_t maskedEntryVAddr = entry.vaddr & ~entry.mask;
+
+            if (maskedVAddr == maskedEntryVAddr) {
+                if (writeAccess && !entry.write) {
+                    std::cerr << "[TLB] Write access violation at VA=0x"
+                              << std::hex << vaddr << std::dec << "\n";
+                    return std::nullopt;
+                }
+
+                return entry.paddr | (vaddr & entry.mask);
+            }
+        }
+        return std::nullopt;
+    }
+
+    void addEntry(uint64_t vaddr, uint64_t paddr, uint64_t mask, bool write = true) {
+        for (auto &e : table) {
+            if (!e.valid) {
+                e.vaddr = vaddr;
+                e.paddr = paddr;
+                e.mask = mask;
+                e.valid = true;
+                e.write = write;
+                e.global = false;
+                e.dirty = false;
+                e.cacheable = true;
+                return;
+            }
+        }
+        std::cerr << "[TLB] Full, unable to insert entry VA=0x" << std::hex << vaddr << std::dec << "\n";
+    }
+
+    void invalidate(uint64_t vaddr) {
+        for (auto &e : table) {
+            if (e.valid && (vaddr & ~e.mask) == (e.vaddr & ~e.mask)) {
+                e.valid = false;
+                std::cout << "[TLB] Invalidated entry VA=0x" << std::hex << vaddr << std::dec << "\n";
+            }
+        }
+    }
+
+    void invalidateAll() {
+        for (auto &e : table) e.valid = false;
+        std::cout << "[TLB] All entries invalidated.\n";
+    }
+
+    void dump() const {
+        std::cout << "TLB Entries:\n";
+        for (size_t i = 0; i < table.size(); ++i) {
+            const auto &e = table[i];
+            if (!e.valid) continue;
+            std::cout << " " << i << ": VA=0x" << std::hex << e.vaddr
+                      << " -> PA=0x" << e.paddr
+                      << " mask=0x" << e.mask
+                      << (e.write ? " W" : " R")
+                      << (e.cacheable ? " C" : " N")
+                      << (e.global ? " G" : "")
+                      << std::dec << "\n";
+        }
+    }
+
+private:
+    std::vector<TLBEntry> table;
+};
+
+// -----------------------------------------------------------
+// Integration with CPU Core
+// -----------------------------------------------------------
+
+void CPU::initTLB(size_t entries) {
+    tlb = std::make_unique<TLB>(entries);
+    std::cout << "[TLB] Initialized with " << entries << " entries.\n";
+}
+
+void CPU::flushTLB() {
+    if (tlb) {
+        tlb->invalidateAll();
+    }
+}
+
+std::optional<uint64_t> CPU::translateAddress(uint64_t vaddr) {
+    if (!tlb) return vaddr;  // identity mapping if no TLB
+
+    bool writeAccess = (currentOpcode & 0x3F) == 0x2B || (currentOpcode & 0x3F) == 0x3F; // SW, SD
+    auto phys = tlb->translate(vaddr, writeAccess);
+    if (!phys) {
+        std::cerr << "[MMU] TLB miss for VA=0x" << std::hex << vaddr << std::dec << "\n";
+    }
+    return phys;
+}
+
+void CPU::debugTLB() const {
+    if (tlb) tlb->dump();
+    else std::cout << "[TLB] Not initialized.\n";
+}
+
+// End of Part 17 - continue in Part 18
+// (paste here code in Part 18)
