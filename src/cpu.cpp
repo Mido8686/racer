@@ -2442,4 +2442,576 @@ void CPU::checkPendingInterrupts() {
 //   if (opcode==0x00 && (instr & 0x3F) in {0x0C,0x0D}) handleSyscallBreak(instr);
 //
 // End of Part 19
-// (paste here code in Part 20)
+// -----------------------------------------------------------
+// CPU Core - TLB refill / invalid exception handling and
+// MMU integration for loads/stores/fetch (Part 20)
+// -----------------------------------------------------------
+//
+// Additions in this part:
+//  - Helpers to raise the correct exception when MMU::translate() fails
+//  - Integrate these helpers into read32/write32 and instruction fetch
+//  - Provide clear mapping: TLBL (load), TLBS (store), Mod, AdEL/AdES fallback
+//  - Keep branch-delay and EPC semantics intact via enterException(...)
+//
+//
+// Assumptions (adjust if your project differs):
+//  - ExceptionCode enum contains values: TLBL, TLBS, Mod, AdEL, AdES, RI, Syscall, Break, Int
+//  - CPU class has CP0 instance accessible as `cp0` or `readCP0`/`writeCP0` wrapper.
+//  - CPU::enterException(ExceptionCode code, uint32_t info) saves EPC/Status/Cause and vectors PC
+//  - MMU->translate(vaddr, size, isWrite) returns std::optional<uint64_t> phys or std::nullopt
+//  - memory.read32/write32 expect a physical address
+//
+// Note: This file intentionally uses `cp0.read(reg)` and `cp0.write(reg, val)` via wrappers
+// `readCP0` / `writeCP0` if present. Adapt if your CPU uses different names.
+//
+// -----------------------------------------------------------
+
+#include <optional>
+#include <iostream>
+#include "mmu.h"
+#include "cp0.h"
+
+// Convenience CP0 register indices (mirror cp0.h)
+static constexpr unsigned CP0_BADVADDR = 8;
+static constexpr unsigned CP0_EPC      = 14;
+static constexpr unsigned CP0_CAUSE    = 13;
+static constexpr unsigned CP0_STATUS   = 12;
+
+// Forward-declared enum - adapt to your project's ExceptionCode
+// enum class ExceptionCode { TLBL=2, TLBS=3, Mod=1, AdEL=4, AdES=5, Syscall=8, Break=9, RI=10, Int=0 };
+
+// Helper: record BadVAddr and set EPC/Cause and jump to exception vector via enterException.
+// This centralizes CP0 bookkeeping for TLB/Address exceptions.
+void CPU::raiseTLBExceptionForAddr(uint64_t vaddr, bool isStore) {
+    // Save BadVAddr (CP0[8]) with the faulting virtual address (word-aligned or full)
+    writeCP0(CP0_BADVADDR, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+
+    // Choose exception type: TLBS for store, TLBL for load/fetch
+    if (isStore) {
+        enterException(ExceptionCode::TLBS, 0);
+    } else {
+        enterException(ExceptionCode::TLBL, 0);
+    }
+
+    if (traceEnabled) {
+        std::cout << "[EXC] TLB " << (isStore ? "store" : "load/fetch") << " exception for vaddr=0x"
+                  << std::hex << vaddr << std::dec << "\n";
+    }
+}
+
+// Helper: raise TLB modification (write-protection) exception (Mod)
+void CPU::raiseTLBModification(uint64_t vaddr) {
+    writeCP0(CP0_BADVADDR, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+    enterException(ExceptionCode::Mod, 0);
+    if (traceEnabled) {
+        std::cout << "[EXC] TLB Modification exception for vaddr=0x" << std::hex << vaddr << std::dec << "\n";
+    }
+}
+
+// Helper: address error (alignment) exceptions: AdEL (load/fetch), AdES (store)
+void CPU::raiseAddressError(uint64_t vaddr, bool isStore) {
+    writeCP0(CP0_BADVADDR, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+    if (isStore) enterException(ExceptionCode::AdES, 0);
+    else enterException(ExceptionCode::AdEL, 0);
+
+    if (traceEnabled) {
+        std::cout << "[EXC] Address alignment error (" << (isStore ? "store" : "load/fetch")
+                  << ") for vaddr=0x" << std::hex << vaddr << std::dec << "\n";
+    }
+}
+
+// MMU-aware read32 helper used by CPU load handlers.
+// Returns a boolean indicating success; outVal is filled on success.
+// On failure, appropriate exception handlers are invoked (TLB refill/invalid or Mod).
+bool CPU::mmuRead32(uint64_t vaddr, uint32_t &outVal) {
+    // Alignment check: MIPS requires word-aligned accesses for lw/sw
+    if (vaddr & 0x3) {
+        raiseAddressError(vaddr, false);
+        return false;
+    }
+
+    // Translate using MMU
+    std::optional<uint64_t> physOpt = translateAddress(vaddr, 4, /*isWrite=*/false);
+    if (!physOpt.has_value()) {
+        // No TLB mapping: raise TLBL (load) exception so kernel/firmware can handle refill
+        raiseTLBExceptionForAddr(vaddr, false);
+        return false;
+    }
+
+    uint32_t phys = static_cast<uint32_t>(*physOpt);
+    // Now read physical memory via Memory abstraction
+    outVal = memory->read32(phys);
+    return true;
+}
+
+// MMU-aware write32 helper used by CPU store handlers.
+// Returns true on success; on failure raises Mod/TLBS/AdES/ etc and returns false.
+bool CPU::mmuWrite32(uint64_t vaddr, uint32_t value) {
+    // Alignment check for stores
+    if (vaddr & 0x3) {
+        raiseAddressError(vaddr, true);
+        return false;
+    }
+
+    // Translate using MMU
+    std::optional<uint64_t> physOpt = translateAddress(vaddr, 4, /*isWrite=*/true);
+    if (!physOpt.has_value()) {
+        // No TLB entry -> TLBS (store) exception
+        raiseTLBExceptionForAddr(vaddr, true);
+        return false;
+    }
+
+    uint32_t phys = static_cast<uint32_t>(*physOpt);
+    // In a fuller model, check page dirty bit / write-protect -> raise Mod if not writable.
+    // Here, we rely on MMU translation to reflect write permission; if translation returned,
+    // assume writable unless your MMU encodes a read-only mapping. If mmu indicates not dirty,
+    // we could call raiseTLBModification instead. For now: attempt write.
+    memory->write32(phys, value);
+    return true;
+}
+
+// Instruction fetch path: use mmu translate and raise TLBL/AdEL as needed.
+// This replaces earlier fetchInstrAt() or augments it to use translateAddress properly.
+uint32_t CPU::fetchInstrAt_mmu(uint64_t vaddr) {
+    // Instruction fetch must be word-aligned
+    if (vaddr & 0x3) {
+        raiseAddressError(vaddr, false);
+        return 0;
+    }
+
+    // Try to use I-cache first (if available) -- keep existing tryICache path if present.
+    uint32_t fromICache = 0;
+    if (tryICache(vaddr, fromICache)) {
+        return fromICache;
+    }
+
+    // Translate virtual PC -> physical
+    std::optional<uint64_t> physOpt = translateAddress(vaddr, 4, /*isWrite=*/false);
+    if (!physOpt.has_value()) {
+        // TLB miss on instruction fetch: raise TLBL (treat like load)
+        raiseTLBExceptionForAddr(vaddr, false);
+        return 0;
+    }
+
+    uint32_t phys = static_cast<uint32_t>(*physOpt);
+    uint32_t instr = memory->read32(phys);
+
+    // Update icache if present
+    updateICache(vaddr, instr);
+    return instr;
+}
+
+// Integration points: update the CPU dispatchers to call mmuRead32/mmuWrite32/fetchInstrAt_mmu
+// Replace calls like `fetchInstrAt(PC)` with `fetchInstrAt_mmu(PC)` and for loads/stores
+// use mmuRead32/mmuWrite32 rather than raw memory accesses.
+//
+// Example changes to earlier handlers:
+//
+//    // LW handler example (inside handleLoadStore()):
+//    uint32_t val;
+//    if (mmuRead32(vaddr, val)) {
+//        setReg(rt, val);
+//    } else {
+//        // mmuRead32 will have already raised the appropriate exception
+//    }
+//
+//    // SW handler:
+//    if (!mmuWrite32(vaddr, getReg(rt))) {
+//        // mmuWrite32 raised exception
+//    }
+//
+//    // Fetch in step/run:
+//    uint32_t instr = fetchInstrAt_mmu(PC);
+//    decodeExecute_augmented(instr);
+//    // then advance/handle pipeline / applyPendingBranch as before
+//
+// IMPORTANT: ensure `checkPendingInterrupts()` is still called periodically (e.g., each step)
+// and CP0::tickCount() is invoked to drive Count/Compare timer behavior.
+
+
+// End of Part 20
+// -----------------------------------------------------------
+// CPU Core - Integrate MMU-aware fetch & load/store callsites
+// (cpu.cpp Part 21)
+// -----------------------------------------------------------
+//
+// This part replaces the prior raw memory access paths with the
+// MMU-aware helpers added in Part 20:
+//   - fetchInstrAt_mmu(...) instead of fetchInstrAt(...)
+//   - mmuRead32(...) and mmuWrite32(...) for loads/stores
+//
+// It also provides a small optional "soft TLB refill" helper you can
+// enable for quick boot convenience (identity-map a page on TLBL/TLBS).
+// By default the soft-refill behavior is disabled so the OS/firmware
+// receives real TLB exceptions and can populate the TLB itself.
+//
+// At the end: the exact marker you requested is placed:
+// (paste here code in Part 22)
+//
+// -----------------------------------------------------------
+
+#include <iostream>
+
+// Toggle to true to allow automatic soft TLB refill (convenience only).
+// Leave false for a faithful CPU that relies on real TLB exceptions.
+static constexpr bool ENABLE_SOFT_TLB_REFILL = false;
+
+// Soft-refill: insert a simple identity mapping for the faulting page.
+// Returns true if it inserted an entry (so caller can retry the access).
+bool CPU::softTLBRefill(uint64_t vaddr) {
+    if (!mmu) return false;
+    // Compute simple 4KB page VPN
+    const uint64_t pageSize = 4096ULL;
+    uint32_t vpn = static_cast<uint32_t>(vaddr / pageSize);
+
+    TLBEntry e{};
+    e.valid = true;
+    e.vpn = vpn;
+    e.pfn = vpn; // identity mapping (vaddr == paddr)
+    e.dirty = true;
+    e.validP = true;
+    e.pageMask = 0; // 4KB
+
+    // Attempt to write to a random slot (emulates TLBWR)
+    unsigned idx = mmu->writeTLBRandom(e);
+    if (traceEnabled) {
+        std::cout << "[MMU] softTLBRefill: inserted identity mapping vpn=0x" << std::hex << vpn
+                  << " at idx=" << std::dec << idx << std::hex << "\n";
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------
+// Updated load/store handler that uses mmuRead32/mmuWrite32 helpers
+// Replaces earlier handleLoadStore(...) implementation from Part 18
+// -----------------------------------------------------------------
+void CPU::handleLoadStore_mmu(uint32_t instr) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    uint32_t rt = (instr >> 16) & 0x1F;
+    int32_t imm = static_cast<int16_t>(instr & 0xFFFF);
+    uint64_t vaddr = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(getReg(rs)) + imm));
+
+    switch (opcode) {
+        case 0x23: { // LW
+            uint32_t val;
+            if (!mmuRead32(vaddr, val)) {
+                // mmuRead32 raised TLBL/AdEL; attempt soft refill if enabled
+                if (ENABLE_SOFT_TLB_REFILL) {
+                    if (softTLBRefill(vaddr)) {
+                        if (!mmuRead32(vaddr, val)) {
+                            // still failed -> give up
+                        } else {
+                            setReg(rt, val);
+                        }
+                    }
+                }
+            } else {
+                setReg(rt, val);
+            }
+            if (traceEnabled) {
+                std::cout << "[EXEC] LW $" << rt << ", " << imm << "($" << rs << ")"
+                          << " -> 0x" << std::hex << getReg(rt) << std::dec << "\n";
+            }
+            break;
+        }
+        case 0x2B: { // SW
+            uint32_t value = static_cast<uint32_t>(getReg(rt));
+            if (!mmuWrite32(vaddr, value)) {
+                if (ENABLE_SOFT_TLB_REFILL) {
+                    if (softTLBRefill(vaddr)) {
+                        mmuWrite32(vaddr, value); // ignore return; mmuWrite32 will raise if failing
+                    }
+                }
+            }
+            if (traceEnabled) {
+                std::cout << "[EXEC] SW $" << rt << ", " << imm << "($" << rs << ")"
+                          << " <- 0x" << std::hex << value << std::dec << "\n";
+            }
+            break;
+        }
+        case 0x21: { // LH
+            // read aligned word via mmu and extract halfword
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                    // proceed
+                } else break;
+            }
+            uint32_t half = (vaddr & 0x2u) ? ((raw >> 16) & 0xFFFFu) : (raw & 0xFFFFu);
+            int16_t sval = static_cast<int16_t>(half);
+            setReg(rt, static_cast<int32_t>(sval));
+            if (traceEnabled) std::cout << "[EXEC] LH $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        case 0x25: { // LHU
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                } else break;
+            }
+            uint32_t half = (vaddr & 0x2u) ? ((raw >> 16) & 0xFFFFu) : (raw & 0xFFFFu);
+            setReg(rt, half);
+            if (traceEnabled) std::cout << "[EXEC] LHU $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        case 0x29: { // SH
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                } else break;
+            }
+            uint16_t half = static_cast<uint16_t>(getReg(rt) & 0xFFFFu);
+            if (vaddr & 0x2u) {
+                raw = (raw & 0x0000FFFFu) | (static_cast<uint32_t>(half) << 16);
+            } else {
+                raw = (raw & 0xFFFF0000u) | static_cast<uint32_t>(half);
+            }
+            mmuWrite32(aligned, raw);
+            if (traceEnabled) std::cout << "[EXEC] SH $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        case 0x20: { // LB
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                } else break;
+            }
+            uint32_t byteShift = (vaddr & 0x3u) * 8;
+            int8_t b = static_cast<int8_t>((raw >> byteShift) & 0xFFu);
+            setReg(rt, static_cast<int32_t>(b));
+            if (traceEnabled) std::cout << "[EXEC] LB $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        case 0x24: { // LBU
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                } else break;
+            }
+            uint32_t byteShift = (vaddr & 0x3u) * 8;
+            uint8_t b = static_cast<uint8_t>((raw >> byteShift) & 0xFFu);
+            setReg(rt, b);
+            if (traceEnabled) std::cout << "[EXEC] LBU $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        case 0x28: { // SB
+            uint64_t aligned = vaddr & ~0x3u;
+            uint32_t raw;
+            if (!mmuRead32(aligned, raw)) {
+                if (ENABLE_SOFT_TLB_REFILL && softTLBRefill(vaddr) && mmuRead32(aligned, raw)) {
+                } else break;
+            }
+            uint32_t byteShift = (vaddr & 0x3u) * 8;
+            uint32_t mask = ~(0xFFu << byteShift);
+            uint32_t newraw = (raw & mask) | ((static_cast<uint32_t>(getReg(rt) & 0xFFu) << byteShift));
+            mmuWrite32(aligned, newraw);
+            if (traceEnabled) std::cout << "[EXEC] SB $" << rt << ", " << imm << "($" << rs << ")\n";
+            break;
+        }
+        default:
+            if (traceEnabled) std::cout << "[WARN] Unhandled load/store opcode 0x" << std::hex << opcode << std::dec << "\n";
+            break;
+    }
+}
+
+// -----------------------------------------------------------------
+// Replace top-level fetch usage with fetchInstrAt_mmu and integrate
+// into the main CPU step/run implementation.
+//
+// Example replacement you should apply in your CPU step() or pipeline:
+// -----------------------------------------------------------------
+//
+// Before (example):
+//    uint32_t instr = fetchInstrAt(PC);
+//    decodeExecute_augmented(instr);
+//    PC += 4;
+//
+// After (use this pattern):
+//    uint32_t instr = fetchInstrAt_mmu(PC);   // will raise TLBL/AdEL on failure
+//    decodeExecute_augmented(instr);
+//    // apply branch/pipeline handling as you already do (applyPendingBranch / nextPC)
+//
+// Below we provide a convenience wrapper stepOnce_mmu() demonstrating integration.
+// -----------------------------------------------------------------
+void CPU::stepOnce_mmu() {
+    // fetch
+    uint32_t instr = fetchInstrAt_mmu(PC);
+    // If an exception was generated by fetchInstrAt_mmu, PC may have been changed;
+    // you can check CP0 EXL/EPC flags or a local exception flag if you track them.
+    // For simplicity here we assume enterException performed correct control-flow change.
+    decodeExecute_augmented(instr);
+
+    // After executing instruction, apply branch / delay semantics like in your earlier run loop
+    applyPendingBranch();
+
+    // Tick CP0 Count (timer)
+    cp0.tickCount();
+
+    // Check hardware interrupts and deliver if pending
+    checkPendingInterrupts();
+}
+
+// -----------------------------------------------------------------
+// End of Part 21
+// (paste here code in Part 22)
+// -----------------------------------------------------------------
+// -----------------------------------------------------------
+// CPU Core - Detailed exception entry for TLB refill/invalid
+// (cpu.cpp Part 22)
+// -----------------------------------------------------------
+//
+// This part expands and hardens exception entry behavior specifically
+// for TLB-refill (TLBL/TLBS), TLB Modification, and general exceptions.
+// It updates CP0 registers (BadVAddr, EntryHi/EPC/Cause/Status) and
+// selects the correct exception vector:
+//
+//   - TLB refill / invalid (TLBL / TLBS)  -> vector 0x80000000
+//   - Other exceptions (Syscall/Break/RI/etc.) -> vector 0x80000180
+//
+// It preserves branch-delay semantics (EPC/Bd handling) and sets EXL.
+// Place this near your existing enterException/doERET logic so callers
+// such as raiseTLBExceptionForAddr() and raiseTLBModification() route
+// into the proper low-level behavior.
+//
+// Note: bit positions for Cause/Status fields are simplified and
+// documented inline — adapt to your CP0 layout if needed.
+//
+
+#include <cstdint>
+#include <iostream>
+
+// Exception vectors (common MIPS conventions)
+// TLB refill (instruction that caused TLB miss / refill) -> 0x80000000
+static constexpr uint64_t EXC_VEC_TLB = 0x80000000ULL;
+// General exceptions -> 0x80000180 (or 0x80000080 depending on CPU; IRIX expects 0x80000180)
+static constexpr uint64_t EXC_VEC_GENERAL = 0x80000180ULL;
+
+// Helper: set Cause register exception code field (bits 2..6) in CP0 cause reg.
+// We assume ExceptionCode values fit in 5 bits.
+static inline void writeCauseCode(CP0 &cp0, uint32_t code) {
+    uint32_t cause = cp0.read(13);
+    cause &= ~(0x1Fu << 2);            // clear bits 2..6
+    cause |= ((code & 0x1Fu) << 2);    // set code
+    cp0.write(13, cause);
+}
+
+// Enhanced enterException that selects vector according to exception type
+void CPU::enterException(ExceptionCode code, uint32_t info) {
+    // Save EPC depending on delay slot status. If inDelaySlot is true,
+    // EPC should point to the branch instruction address (PC - 4) and
+    // the BD (Branch Delay) bit should be set in Cause.
+    uint32_t epcToSave = static_cast<uint32_t>(PC);
+    if (inDelaySlot) {
+        // Save the branch instruction address
+        epcToSave = static_cast<uint32_t>(PC - 4);
+        // Set BD bit in Cause (bit 31 in many MIPS cores).
+        uint32_t cause = readCP0(CP0_CAUSE);
+        cause |= (1u << 31);
+        writeCP0(CP0_CAUSE, cause);
+    } else {
+        // Clear BD bit
+        uint32_t cause = readCP0(CP0_CAUSE);
+        cause &= ~(1u << 31);
+        writeCP0(CP0_CAUSE, cause);
+    }
+
+    // Store EPC
+    writeCP0(CP0_EPC, epcToSave);
+
+    // If info contains a BadVAddr (caller can pass it), store it in CP0 BadVAddr.
+    // Convention: callers (raiseTLBExceptionForAddr/raiseAddressError) set CP0_BADVADDR themselves.
+    if (info != 0) {
+        writeCP0(CP0_BADVADDR, info);
+    }
+
+    // Set Cause exception code bits
+    writeCauseCode(cp0, static_cast<uint32_t>(code));
+
+    // Set EXL bit (Status[1]) to 1 to enter exception mode
+    uint32_t status = readCP0(CP0_STATUS);
+    status |= (1u << 1); // EXL = 1
+    writeCP0(CP0_STATUS, status);
+
+    // Choose exception vector depending on exception type
+    uint64_t vector = EXC_VEC_GENERAL;
+    // Treat TLB-related exceptions and Modification specially
+    if (code == ExceptionCode::TLBL || code == ExceptionCode::TLBS || code == ExceptionCode::Mod) {
+        vector = EXC_VEC_TLB;
+    } else {
+        vector = EXC_VEC_GENERAL;
+    }
+
+    // Set PC to vector and nextPC to vector + 4
+    setPC(vector);
+    nextPC = PC + 4;
+    inDelaySlot = false;
+
+    if (traceEnabled) {
+        std::cout << "[EXC] enterException(code=" << static_cast<int>(code)
+                  << ", EPC=0x" << std::hex << epcToSave
+                  << ", BADV=0x" << (uint32_t)readCP0(CP0_BADVADDR)
+                  << ", vec=0x" << vector << std::dec << ")\n";
+    }
+}
+
+// Optional helper: populate CP0 EntryHi from BadVAddr (useful on a TLB fault)
+// In many MIPS variants EntryHi contains VPN and ASID bits; we emulate a minimal form.
+void CPU::populateEntryHiFromBadVAddr() {
+    // If your CP0 implements EntryHi at register number 10 (common),
+    // write the top bits of BadVAddr into it. Adjust index if different.
+    static constexpr unsigned CP0_ENTRYHI = 10;
+    uint32_t badv = readCP0(CP0_BADVADDR);
+    // EntryHi: VPN (bits [31:13]) and ASID low bits (7:0) are common placements.
+    // We simply copy the badv upper bits into EntryHi (mask to page-aligned VPN).
+    uint32_t entryhi = (badv & 0xFFFFE000u); // keep VPN region (assuming 4KB pages)
+    // Preserve ASID low bits already in EntryHi if any
+    uint32_t old = readCP0(CP0_ENTRYHI);
+    uint32_t asid = old & 0xFFu;
+    writeCP0(CP0_ENTRYHI, (entryhi | asid));
+    if (traceEnabled) {
+        std::cout << "[CP0] populateEntryHiFromBadVAddr: EntryHi=0x" << std::hex << readCP0(CP0_ENTRYHI) << std::dec << "\n";
+    }
+}
+
+// TLB-refill specific handler helper: called when mmu->translate returns nullopt.
+// It performs CP0 BadVAddr/EntryHi updates and then enters the TLBR/TLBS exception vector.
+//
+// isStore == true  -> TLBS (store TLB refill)
+// isStore == false -> TLBL (load/instruction TLB refill)
+void CPU::handleTLBRefill(uint64_t vaddr, bool isStore) {
+    // record badvaddr
+    writeCP0(CP0_BADVADDR, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+    // populate EntryHi for OS convenience (so OS can use EntryHi to form TLB entry)
+    populateEntryHiFromBadVAddr();
+    // Enter the appropriate exception (this will set EPC/Cause/Status and vector to 0x80000000)
+    if (isStore) enterException(ExceptionCode::TLBS, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+    else enterException(ExceptionCode::TLBL, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+}
+
+// TLB modification (write-protect) handler: set BadVAddr/EntryHi and enter Mod vector
+void CPU::handleTLBModification(uint64_t vaddr) {
+    writeCP0(CP0_BADVADDR, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+    populateEntryHiFromBadVAddr();
+    enterException(ExceptionCode::Mod, static_cast<uint32_t>(vaddr & 0xFFFFFFFFu));
+}
+
+// Integrate new handlers with translate failures:
+// Replace earlier raiseTLBExceptionForAddr() calls (or keep them) to call handleTLBRefill()
+// So, in mmuRead32 / mmuWrite32 / fetchInstrAt_mmu you can replace:
+//    raiseTLBExceptionForAddr(vaddr, isStore);
+// with:
+//    handleTLBRefill(vaddr, isStore);
+//
+// Example (recommended):
+//   if (!physOpt) { handleTLBRefill(vaddr, false); return false; }
+//
+// The above ensures EntryHi is filled and the CPU jumps to the canonical TLB refill vector.
+//
+// End of Part 22
+// (paste here code in Part 23)
