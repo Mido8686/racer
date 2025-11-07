@@ -4,6 +4,49 @@
 #include <iomanip>
 #include <cstdint>
 #include <string>
+#include "emulator.h"
+#include <iostream>
+
+int emulator_main(const std::string &prom_path, const std::string &irix_iso_path) {
+    try {
+        Emulator emu;
+        emu.init();
+
+        // Attach a framebuffer device so user sees display (optional).
+        // Choose MMIO base and framebuffer physical base consistent with dev/framebuffer defaults.
+        const uint64_t fb_mmio = 0x1F000000ULL;
+        const uint64_t fb_phys = 0x10000000ULL;
+        emu.attach_framebuffer(fb_mmio, fb_phys);
+
+        // Load PROM
+        if (!emu.load_prom(prom_path)) {
+            std::cerr << "[MAIN] Failed to load PROM: " << prom_path << "\n";
+            return 2;
+        }
+
+        // Optionally, if an IRIX ISO path was provided, register it as a virtual CD-ROM.
+        // This requires SCSI/CD emulation not included here; provide hook for later:
+        if (!irix_iso_path.empty()) {
+            std::cout << "[MAIN] IRIX ISO provided: " << irix_iso_path << "\n";
+            // Hook point: emu.attach_cdrom(irix_iso_path) or mount ISO into disk subsystem.
+            // If you implemented load_disk_image to accept ISO, call it:
+            // emu.load_disk_image(irix_iso_path);
+        }
+
+        // Reset CPU & start running
+        emu.reset();
+        emu.run();
+
+        // Cleanup happens in Emulator destructor
+        return 0;
+    } catch (const std::exception &ex) {
+        std::cerr << "[MAIN] Uncaught exception: " << ex.what() << "\n";
+        return 99;
+    } catch (...) {
+        std::cerr << "[MAIN] Unknown fatal error\n";
+        return 100;
+    }
+}
 
 // -----------------------------------------------------------
 // Speedracer Emulator (SGI Octane1 / IP30)
