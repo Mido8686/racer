@@ -1,48 +1,57 @@
-*** Begin Patch: src/mmu.h
-*** Update File
-@@
- #include <array>
- 
- struct TLBEntry {
-     bool valid = false;
-     uint32_t vpn = 0;      // virtual page number (high bits of vaddr)
-     uint32_t pfn = 0;      // physical frame number (high bits of paddr)
-     uint32_t asid = 0;     // address space id
-     bool global = false;
-     bool dirty = true;
-     bool validP = true;    // PFN valid
-     uint32_t pageMask = 0x00000000; // small pages only for now
- };
- 
- class Memory; // forward
- 
- class MMU {
- public:
-     MMU(Memory *mem, class CP0 *cp0, unsigned tlbSize = 64);
- 
-@@
-     // Insert / update TLB entry (software-managed)
-     void insertTLBEntry(unsigned index, const TLBEntry &e);
- 
-+    // TLB management helpers:
-+    // Read entry at index (returns optional to indicate validity)
-+    std::optional<TLBEntry> readTLBEntry(unsigned index) const;
-+    // Write entry at index
-+    void writeTLBEntry(unsigned index, const TLBEntry &e);
-+    // Write entry using Random pointer (WRAP style). Returns the index written.
-+    unsigned writeTLBRandom(const TLBEntry &e);
-+    // Probe for entry matching vpn; returns index or -1 if not found
-+    int probeTLB(uint32_t vpn) const;
-+
-     // Simple utilities
-     void flushAll();
- 
- private:
-     Memory *memory;
-     CP0 *cp0;
-     std::vector<TLBEntry> tlb;
-     unsigned tlbSize;
-+    // Simple random pointer for TLBWR behaviour
-+    unsigned randomPtr = 0;
- };
-*** End Patch
+// -----------------------------------------------------------
+// mmu.h
+// -----------------------------------------------------------
+// Speedracer SGI Octane1 Emulator
+// Memory-Management Unit interface
+// -----------------------------------------------------------
+
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <stdexcept>
+
+// Forward declarations
+class Memory;
+class CP0;
+
+// Simple TLB entry (placeholder for future full MIPS64)
+struct TLBEntry {
+    uint64_t vpn2 = 0;
+    uint64_t pfn  = 0;
+    uint32_t asid = 0;
+    bool     valid = false;
+    bool     dirty = false;
+};
+
+// -----------------------------------------------------------
+// MMU class
+// -----------------------------------------------------------
+class MMU {
+public:
+    MMU();
+    ~MMU();
+
+    void attach_memory(Memory* m);
+    void attach_cp0(CP0* c);
+
+    // Flat or TLB-translated memory access
+    uint32_t read32(uint64_t vaddr);
+    void     write32(uint64_t vaddr, uint32_t value);
+
+    // TLB control
+    void reset();
+    void set_tlb_enabled(bool en) { enable_tlb = en; }
+    bool is_tlb_enabled() const { return enable_tlb; }
+
+private:
+    Memory* mem = nullptr;
+    CP0*    cp0 = nullptr;
+    bool    enable_tlb = false;
+
+    // Simple 64-entry table for later full implementation
+    static constexpr int MAX_TLB = 64;
+    TLBEntry tlb[MAX_TLB];
+
+    uint64_t translate(uint64_t vaddr);
+    uint64_t tlb_translate(uint64_t vaddr);
+};
