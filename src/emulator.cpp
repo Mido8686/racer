@@ -1,29 +1,95 @@
-*** Begin Patch: src/emulator.cpp
-*** Update File
-@@
- void Emulator::init() {
-     std::cout << "Speedracer Emulator — SGI Octane1 prototype\n";
--    // register simple console device at a small range
--    // bus.register_device(...)
-+    // --- MMU / CP0 wiring (new) ---
-+    // Ensure cpu has a pointer to the Memory object and an MMU instance.
-+    cpu.memory = &mem;
-+    // create an MMU with a small TLB (64 entries default). Emulator owns the MMU.
-+    cpu.mmu = new MMU(&mem, &cpu.cp0, 64);
-+
-+    // Insert a simple identity TLB entry for low memory (so boot ROM / startup code runs).
-+    // This is a pragmatic short-circuit while MMU/TLB refill code is implemented.
-+    {
-+        TLBEntry e{};
-+        e.valid = true;
-+        e.vpn = 0x0;          // VPN 0 -> low virtual pages map to low physical pages
-+        e.pfn = 0x0;          // PFN 0
-+        e.dirty = true;
-+        e.validP = true;
-+        cpu.mmu->insertTLBEntry(0, e);
-+    }
-+
-+    // register simple console device at a small range
-+    // bus.register_device(...)
- }
-*** End Patch
+// -----------------------------------------------------------
+// emulator.cpp (Part 1 — Core System Setup)
+// -----------------------------------------------------------
+// Speedracer SGI Octane1 Emulator
+// Core initialization:
+//   - Create CPU, MMU, CP0, Memory
+//   - Wire all subsystems together
+//   - Provide run loop
+//   - Provide physical read/write for devices
+// -----------------------------------------------------------
+
+#include "emulator.h"
+#include "cpu.h"
+#include "mmu.h"
+#include "memory.h"
+#include "cp0.h"
+#include <iostream>
+
+Emulator::Emulator()
+{
+    cpu  = new CPU();
+    mmu  = new MMU();
+    cp0  = new CP0();
+    mem  = new Memory();
+}
+
+Emulator::~Emulator()
+{
+    delete cpu;
+    delete mmu;
+    delete cp0;
+    delete mem;
+}
+
+// -----------------------------------------------------------
+// Initialize emulator
+// -----------------------------------------------------------
+bool Emulator::init(uint64_t ram_size)
+{
+    std::cout << "[Emu] Initializing system...\n";
+
+    // Setup RAM
+    mem->init(ram_size);
+
+    // Attach subsystems
+    cpu->attach_mmu(mmu);
+    cpu->attach_cp0(cp0);
+
+    mmu->attach_memory(mem);
+    mmu->attach_cp0(cp0);
+
+    cp0->attach_cpu(cpu);
+
+    // Reset all components
+    cp0->reset();
+    mmu->reset();
+    cpu->reset();
+
+    std::cout << "[Emu] System ready.\n";
+    return true;
+}
+
+// -----------------------------------------------------------
+// Load PROM (declared in Part 2)
+// -----------------------------------------------------------
+bool Emulator::load_prom(const std::string& path);
+
+// -----------------------------------------------------------
+// Main execution loop
+// -----------------------------------------------------------
+void Emulator::run(uint64_t cycles)
+{
+    std::cout << "[Emu] Starting CPU...\n";
+
+    for (uint64_t i = 0; i < cycles; i++)
+    {
+        cpu->step();
+
+        // For future: handle timers, interrupts, VBLANK, DMA
+    }
+}
+
+// -----------------------------------------------------------
+// System read/write (to be filled by Part 2: MMIO)
+// Default behavior: direct RAM access
+// -----------------------------------------------------------
+uint32_t Emulator::sys_read32(uint64_t phys)
+{
+    return mem->read32(phys);
+}
+
+void Emulator::sys_write32(uint64_t phys, uint32_t val)
+{
+    mem->write32(phys, val);
+}
