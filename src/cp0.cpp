@@ -1,94 +1,110 @@
+// -----------------------------------------------------------
+// cp0.cpp
+// -----------------------------------------------------------
+// Speedracer SGI Octane1 Emulator
+// Minimal CP0 implementation
+// -----------------------------------------------------------
+
 #include "cp0.h"
-#include <cassert>
-#include <iostream>
+#include "cpu.h"
 
-CP0::CP0() {
-    regs.fill(0);
-    // Typical default: EXL clear, IE may be set by firmware. Leave 0 here.
+CP0::CP0() {}
+CP0::~CP0() {}
+
+void CP0::reset() {
+    index = random = entry_lo0 = entry_lo1 = 0;
+    context = pagemask = wired = 0;
+    bad_vaddr = 0;
+    count = compare = 0;
+    entry_hi = 0;
+
+    status = 0x00000000;   // interrupt disabled, kernel mode
+    cause  = 0x00000000;
+    epc    = 0xFFFFFFFFFFFFFFFF;
+
+    prid = 0x00000000;     // placeholder (R10000 PRID later)
+
+    std::cout << "[CP0] Reset complete.\n";
 }
 
-uint32_t CP0::read(unsigned reg) const {
-    assert(reg < regs.size());
-    return regs[reg];
+void CP0::attach_cpu(CPU* c) {
+    cpu = c;
 }
 
-void CP0::write(unsigned reg, uint32_t value) {
-    assert(reg < regs.size());
-    // Special handling for some registers:
-    switch (reg) {
-        case REG_COUNT:
-            regs[REG_COUNT] = value;
-            break;
-        case REG_COMPARE:
-            regs[REG_COMPARE] = value;
-            // Writing to Compare usually clears the timer interrupt bit in Cause
-            // Clear IP7..IP0 bits (implementation detail): here we clear the timer flag bit 7 in Cause.
-            regs[REG_CAUSE] &= ~(1u << 15); // simple example: clear one IP bit
-            break;
-        case REG_STATUS:
-            // Mask out read-only/reserved bits in a fuller implementation.
-            regs[REG_STATUS] = value;
-            break;
-        case REG_CAUSE:
-            // In many cores cause is mostly read-only; allow writing some bits (e.g., software-set IP)
-            regs[REG_CAUSE] = (regs[REG_CAUSE] & ~0xFF00u) | (value & 0xFF00u);
-            break;
+// -----------------------------------------------------------
+// read_reg() - simplified CP0 read
+// -----------------------------------------------------------
+uint64_t CP0::read_reg(uint32_t idx) const {
+    switch (idx) {
+        case 0:  return index;
+        case 1:  return random;
+        case 2:  return entry_lo0;
+        case 3:  return entry_lo1;
+        case 4:  return context;
+        case 5:  return pagemask;
+        case 6:  return wired;
+        case 8:  return bad_vaddr;
+        case 9:  return count;
+        case 10: return entry_hi;
+        case 11: return compare;
+        case 12: return status;
+        case 13: return cause;
+        case 14: return epc;
+        case 15: return prid;
         default:
-            regs[reg] = value;
+            std::cerr << "[CP0] Warning: unimplemented register read " << idx << "\n";
+            return 0;
+    }
+}
+
+// -----------------------------------------------------------
+// write_reg() - simplified CP0 write
+// -----------------------------------------------------------
+void CP0::write_reg(uint32_t idx, uint64_t value) {
+    switch (idx) {
+        case 2:  entry_lo0 = value; break;
+        case 3:  entry_lo1 = value; break;
+        case 4:  context   = value; break;
+        case 5:  pagemask  = value; break;
+        case 6:  wired     = value; break;
+        case 9:  count     = value; break;
+        case 10: entry_hi  = value; break;
+        case 11: compare   = value; break;
+        case 12: status    = value; break;
+        case 13: cause     = value; break;
+        case 14: epc       = value; break;
+        default:
+            std::cerr << "[CP0] Warning: unimplemented register write " 
+                      << idx << " = 0x" << std::hex << value << std::dec << "\n";
             break;
     }
 }
 
-void CP0::setEXL(bool v) {
-    if (v) regs[REG_STATUS] |= (1u << 1);
-    else regs[REG_STATUS] &= ~(1u << 1);
+// -----------------------------------------------------------
+// raise_exception()
+// -----------------------------------------------------------
+void CP0::raise_exception(uint32_t code, uint64_t badaddr) {
+    bad_vaddr = badaddr;
+    cause = (cause & ~0x7C) | (code << 2); // simple encoding
+
+    // Save PC where exception occurred
+    if (cpu) epc = cpu->getPC();
+
+    // Set EXL bit (bit 1)
+    status |= (1 << 1);
+
+    std::cerr << "[CP0] Exception " << code 
+              << " at PC=0x" << std::hex << epc 
+              << " badaddr=0x" << badaddr << std::dec << "\n";
 }
 
-bool CP0::getEXL() const {
-    return (regs[REG_STATUS] & (1u << 1)) != 0;
-}
-
-void CP0::setEPC(uint32_t v) {
-    regs[REG_EPC] = v;
-}
-
-uint32_t CP0::getEPC() const {
-    return regs[REG_EPC];
-}
-
-void CP0::setCause(uint32_t v) {
-    regs[REG_CAUSE] = v;
-}
-
-uint32_t CP0::getCause() const {
-    return regs[REG_CAUSE];
-}
-
-void CP0::tickCount() {
-    // Increment Count register; on overflow compared to Compare, set timer interrupt IPx bit in Cause.
-    // This is a very simple model — in a more accurate model Count increments once per two cycles, etc.
-    uint32_t count = ++regs[REG_COUNT];
-    uint32_t compare = regs[REG_COMPARE];
-
-    if (compare != 0 && count == compare) {
-        // Set a software timer interrupt bit in Cause register: use IP7 as example (bit 15).
-        regs[REG_CAUSE] |= (1u << 15);
-        // Optionally, signal to CPU/MMU via some callback — we'll let CPU poll CP0::getHWPending or read Cause.
-        if (false) { // placeholder to illustrate where one could add a callback hook
-            std::cout << "[CP0] Timer interrupt set (Count==Compare)\n";
-        }
-    }
-}
-
-void CP0::setHWPending(uint32_t mask) {
-    // Place mask into Cause IP bits area (commonly bits 8..15)
-    regs[REG_CAUSE] |= ((mask & 0xFFu) << 8);
-}
-
-void CP0::clearHWPending(uint32_t mask) {
-    regs[REG_CAUSE] &= ~((mask & 0xFFu) << 8);
-}
-
-uint32_t CP0::getHWPending() const {
-    return (regs[REG_CAUSE] >> 8) & 0xFFu;
+// -----------------------------------------------------------
+// is_tlb_enabled()
+// -----------------------------------------------------------
+bool CP0::is_tlb_enabled() const {
+    // MMU full TLB mode active only if:
+    //  EXL=0 (bit 1), ERL=0 (bit 2)
+    bool exl = (status >> 1) & 1;
+    bool erl = (status >> 2) & 1;
+    return (!exl && !erl);
 }
