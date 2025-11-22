@@ -1,7 +1,7 @@
 // -----------------------------------------------------------
 // memory.h
 // -----------------------------------------------------------
-// Speedracer SGI Octane1 Emulator
+// Racer SGI Octane1 Emulator
 // Simple byte-addressable RAM + ROM memory system
 // Supports dynamic RAM sizing (set from TUI Settings)
 // -----------------------------------------------------------
