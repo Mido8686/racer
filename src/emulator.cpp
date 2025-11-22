@@ -1,7 +1,7 @@
 // -----------------------------------------------------------
 // emulator.cpp (Part 1 — Core System Setup)
 // -----------------------------------------------------------
-// Speedracer SGI Octane1 Emulator
+// Racer SGI Octane1 Emulator
 // Core initialization:
 //   - Create CPU, MMU, CP0, Memory
 //   - Wire all subsystems together
