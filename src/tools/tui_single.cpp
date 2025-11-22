@@ -1,5 +1,5 @@
 // tui_single.cpp
-// Speedracer (SGI Octane1) TUI launcher
+// Racer (SGI Octane1) TUI launcher
 // -------------------------------------
 // Text-based user interface to launch the SGI Octane emulator.
 // Checks for required PROM file: ip30prom.rev4.9.bin
@@ -30,7 +30,7 @@ void pause_for_key() {
 
 void draw_header() {
     std::cout << "┌────────────────────────────────────┐\n";
-    std::cout << "│  Speedracer SGI Octane1 Emulator   │\n";
+    std::cout << "│    Racer SGI Octane1 Emulator      │\n";
     std::cout << "├────────────────────────────────────┤\n";
 }
 
