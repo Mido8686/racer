@@ -1,5 +1,5 @@
 // -----------------------------------------------------------
-// cpu.cpp  (Speedracer SGI Octane Emulator)
+// cpu.cpp  (Racer SGI Octane Emulator)
 // Part 1 — Includes, CPU State, Constructor, Reset
 // -----------------------------------------------------------
 
@@ -81,7 +81,7 @@ void CPU::init_decode_tables()
 // paste code here in Part 2
 //------------------------------------------------------------
 // -----------------------------------------------------------
-// cpu.cpp  (Speedracer SGI Octane Emulator)
+// cpu.cpp  (Racer SGI Octane Emulator)
 // Part 2 — Decode Tables + Initialization
 // -----------------------------------------------------------
 
@@ -208,7 +208,7 @@ void CPU::init_decode_tables()
 // paste code here in Part 3
 // -----------------------------------------------------------
 // -----------------------------------------------------------
-// cpu.cpp  (Speedracer SGI Octane Emulator)
+// cpu.cpp  (Racer SGI Octane Emulator)
 // Part 3 — Endian Helpers + Exceptions + MMU Safe Access
 // -----------------------------------------------------------
 
@@ -296,7 +296,7 @@ void CPU::address_error()
 // paste code here in Part 4
 // -----------------------------------------------------------
 // -----------------------------------------------------------
-// cpu.cpp  (Speedracer SGI Octane Emulator)
+// cpu.cpp  (Racer SGI Octane Emulator)
 // Part 4 — Instruction Implementations (PROM Mandatory Subset)
 // -----------------------------------------------------------
 //
@@ -499,7 +499,7 @@ static void instr_BREAK(CPU* c, uint32_t)
 // paste code here in Part 5
 // -----------------------------------------------------------
 // -----------------------------------------------------------
-// cpu.cpp  (Speedracer SGI Octane Emulator)
+// cpu.cpp  (Racer SGI Octane Emulator)
 // Part 5 — IRIX Required Instructions (HI/LO, MULT/DIV, REGIMM)
 // -----------------------------------------------------------
 //
