@@ -1,7 +1,7 @@
-# 🏎️ Speedracer Emulator  
+# 🏎️ Racer Emulator  
 ### SGI Octane1 (IP30) Hardware Emulator  
 
-**Speedracer Emulator** is an open-source project that aims to **emulate the Silicon Graphics Octane1 (IP30)** workstation system from scratch.  
+**Racer Emulator** is an open-source project that aims to **emulate the Silicon Graphics Octane1 (IP30)** workstation system from scratch.  
 It is designed to be **fully implemented**, **accurate**, and **user-friendly** — allowing enthusiasts and developers to explore SGI hardware and firmware behavior.
 
 ---
@@ -21,7 +21,7 @@ Core goals include:
 
 ## 📦 Requirements
 
-To run **Speedracer Emulator**, you will need a valid SGI Octane1 PROM file:
+To run **Racer Emulator**, you will need a valid SGI Octane1 PROM file:
 
 `ip30prom.rev4.9.bin`
 
@@ -51,7 +51,7 @@ To run **Speedracer Emulator**, you will need a valid SGI Octane1 PROM file:
 
 - PROM base address: `0xBFC00000` (1 MiB region)  
 - Compatible firmware: `SGI Version 6.5 Rev 4.9 IP30 (May 22, 2003)`  
-- Emulator name: **Speedracer** 🏎️ — designed for both **speed** and **accuracy**
+- Emulator name: **Racer** 🏎️ — designed for both **speed** and **accuracy**
 
 ---
 
