@@ -1,4 +1,4 @@
-// speedracer/src/membus.h
+// racer/src/membus.h
 // Minimal MemoryBus abstraction: ROM + MMIO device registration.
 //
 // Usage:
