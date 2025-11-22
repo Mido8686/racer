@@ -49,7 +49,7 @@ int emulator_main(const std::string &prom_path, const std::string &irix_iso_path
 }
 
 // -----------------------------------------------------------
-// Speedracer Emulator (SGI Octane1 / IP30)
+// Racer Emulator (SGI Octane1 / IP30)
 // Initial Boot Framework - PROM Loader
 // -----------------------------------------------------------
 // Author: Mohamed Zeidan
@@ -117,7 +117,7 @@ private:
 // -----------------------------------------------------------
 int main() {
     std::cout << "=====================================\n";
-    std::cout << "  Speedracer Emulator (SGI Octane1)\n";
+    std::cout << "  Racer Emulator (SGI Octane1)\n";
     std::cout << "  Boot Framework - PROM Loader\n";
     std::cout << "=====================================\n";
 
