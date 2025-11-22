@@ -1,7 +1,7 @@
 // -----------------------------------------------------------
 // emulator.h
 // -----------------------------------------------------------
-// Speedracer SGI Octane1 Emulator
+// Racer SGI Octane1 Emulator
 // Master system controller for CPU/MMU/MEM/Devices
 // -----------------------------------------------------------
 
