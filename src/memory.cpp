@@ -1,7 +1,7 @@
 // -----------------------------------------------------------
 // memory.cpp
 // -----------------------------------------------------------
-// Speedracer SGI Octane1 Emulator
+// Racer SGI Octane1 Emulator
 // RAM implementation with safe read/write
 // -----------------------------------------------------------
 
