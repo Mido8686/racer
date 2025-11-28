@@ -666,3 +666,839 @@ static void instr_BGEZAL(CPU* c, uint32_t ins)
 // PART 5 END
 // paste code here in Part 6
 // -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 7 — CPU Execution Loop (stepOnce, PC update, delay slots)
+// -----------------------------------------------------------
+//
+// MIPS R10000 uses delayed branches. PROM and IRIX both depend
+// on correct behavior of:
+//
+//   1. Execute instruction at PC
+//   2. If branch, execute *next* instruction as delay slot
+//   3. After delay slot, jump to target
+//
+// This model is cycle-approximate, not cycle-accurate.
+// -----------------------------------------------------------
+
+
+// -----------------------------------------------------------
+// Step ONE instruction
+// -----------------------------------------------------------
+void CPU::stepOnce()
+{
+    // Fetch next instruction
+    uint32_t ins = load32_be(pc);
+
+    // The instruction after this one
+    uint64_t oldPC   = pc;
+    uint64_t oldNext = nextPC;
+
+    // Default nextPC = PC + 4
+    nextPC = pc + 4;
+
+    // Execute instruction (does NOT update PC)
+    decode_and_execute(ins);
+
+    // Enforce register $0 = 0
+    regs[0] = 0;
+
+    // ------------------------------------------
+    // Handle delayed branch slot
+    // ------------------------------------------
+    //
+    // If decode_and_execute() changed nextPC away from pc+4,
+    // then this instruction is a branch/jump.
+    //
+    // Behavior:
+    //   • Execute delay-slot instruction from pc+4
+    //   • Then pc = nextPC computed by branch
+    //
+    // ------------------------------------------
+    if (nextPC != oldPC + 4)
+    {
+        uint64_t branchTarget = nextPC;
+
+        // Execute delay slot instruction (one instruction)
+        uint32_t delayIns = load32_be(oldPC + 4);
+        decode_and_execute(delayIns);
+
+        // Enforce $0 again
+        regs[0] = 0;
+
+        // Now jump to branch target
+        pc     = branchTarget;
+        nextPC = pc + 4;
+        return;
+    }
+
+    // ------------------------------------------
+    // No branch → normal sequential execution
+    // ------------------------------------------
+    pc = nextPC;
+}
+
+
+// -----------------------------------------------------------
+// PART 7 END
+// paste code here in Part 8
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 8 — Basic timing + MULT/DIV latency + CP0 integration
+// -----------------------------------------------------------
+//
+// This part adds:
+//
+// • Basic cycle counter
+// • MULT / DIV latency handling
+// • CP0 EPC integration for exceptions
+// • Safe step() wrapper for whole emulator
+//
+// NOT included yet:
+// • Full R10000 out-of-order pipeline (future Part 10+)
+//
+// -----------------------------------------------------------
+
+
+// -----------------------------------------------------------
+// Cycle counting
+// -----------------------------------------------------------
+
+void CPU::addCycles(uint32_t c)
+{
+    cycles += c;
+}
+
+
+// -----------------------------------------------------------
+// MULT/DIV latency counters
+// -----------------------------------------------------------
+//
+// True R10000 latencies:
+//   MULT  →  4 cycles
+//   DIV   → 35 cycles
+//
+// We simplify to match PROM + IRIX expectations.
+//
+// -----------------------------------------------------------
+
+void CPU::tick_mult_div()
+{
+    if (multBusy > 0)
+        multBusy--;
+
+    if (divBusy > 0)
+        divBusy--;
+}
+
+
+// -----------------------------------------------------------
+// Overwrite MULT/MULTU to add latency
+// Called automatically by decode table logic
+// -----------------------------------------------------------
+
+static void instr_MULT_latency(CPU* c, uint32_t ins)
+{
+    instr_MULT(c, ins);
+    c->multBusy = 4;   // Simplified latency
+}
+
+static void instr_MULTU_latency(CPU* c, uint32_t ins)
+{
+    instr_MULTU(c, ins);
+    c->multBusy = 4;
+}
+
+static void instr_DIV_latency(CPU* c, uint32_t ins)
+{
+    instr_DIV(c, ins);
+    c->divBusy = 35;   // Simplified safe latency
+}
+
+static void instr_DIVU_latency(CPU* c, uint32_t ins)
+{
+    instr_DIVU(c, ins);
+    c->divBusy = 35;
+}
+
+
+// -----------------------------------------------------------
+// Check if HI/LO reg is available
+// PROM and IRIX depend on this behavior
+// -----------------------------------------------------------
+bool CPU::hiloBusy() const
+{
+    return (multBusy > 0) || (divBusy > 0);
+}
+
+
+// -----------------------------------------------------------
+// Exception + CP0 integration
+// -----------------------------------------------------------
+
+void CPU::handle_exception(int code)
+{
+    // CP0 must calculate EPC
+    if (cp0)
+        cp0->raise_exception(code, pc);
+
+    // Jump to general exception vector
+    // PROM uses bootstrap vector 0x1fc00380
+    pc     = 0x1FC00380ULL;
+    nextPC = pc + 4;
+}
+
+
+// -----------------------------------------------------------
+// CPU step - including latency tick
+// -----------------------------------------------------------
+
+void CPU::step()
+{
+    // Tick MULT/DIV latency
+    tick_mult_div();
+
+    // Execute a single instruction
+    stepOnce();
+
+    // Add cycle for this instruction
+    addCycles(1);
+}
+
+
+// -----------------------------------------------------------
+// PART 8 END
+// paste code here in Part 9
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 9 — CP0 / COP0 integration (MFC0, MTC0, ERET)
+// -----------------------------------------------------------
+//
+// This part implements minimal COP0 support required for PROM/IRIX:
+//  - MFC0 (move from CP0)  : COP0, rs == 0
+//  - MTC0 (move to CP0)    : COP0, rs == 4
+//  - ERET (exception return): canonical opcode 0x42000018
+//
+// Behavior notes:
+//  - MFC0: RT <- CP0[rd]
+//  - MTC0: CP0[rd] <- RT
+//  - ERET: clear EXL in CP0 status and set PC = CP0.EPC
+//
+// These are conservative implementations sufficient for early IRIX:
+// -----------------------------------------------------------
+
+
+static void instr_COP0(CPU* c, uint32_t ins)
+{
+    // If the instruction equals canonical ERET encoding, handle it.
+    // ERET common encoding: 0x42000018
+    if (ins == 0x42000018u) {
+        // ERET: clear EXL and set PC = EPC
+        if (c->cp0) {
+            uint64_t epc = c->cp0->read_reg(14); // EPC reg
+            // Clear EXL bit (bit 1) in Status (reg 12)
+            uint64_t status = c->cp0->read_reg(12);
+            status &= ~(1ULL << 1);
+            c->cp0->write_reg(12, status);
+            // Jump to EPC
+            c->nextPC = epc;
+            return;
+        } else {
+            // No CP0 connected; treat like NOP or raise exception
+            std::cerr << "[CPU] ERET executed but CP0 missing\n";
+            return;
+        }
+    }
+
+    // Otherwise decode MFC0 / MTC0 by rs field
+    uint32_t rs = RS(ins);
+    uint32_t rt = RT(ins);
+    uint32_t rd = RD(ins);
+
+    if (rs == 0x00) {
+        // MFC0: move from CP0 register rd -> GPR rt
+        if (!c->cp0) {
+            std::cerr << "[CPU] MFC0 but CP0 missing\n";
+            c->regs[rt] = 0;
+            return;
+        }
+        uint64_t v = c->cp0->read_reg(rd);
+        c->regs[rt] = v;
+        return;
+    }
+
+    if (rs == 0x04) {
+        // MTC0: move GPR rt -> CP0 register rd
+        if (!c->cp0) {
+            std::cerr << "[CPU] MTC0 but CP0 missing\n";
+            return;
+        }
+        c->cp0->write_reg(rd, c->regs[rt]);
+        return;
+    }
+
+    // Unhandled COP0 sub-op: log and ignore
+    std::cerr << "[CPU] Unhandled COP0 ins rs=0x" << std::hex << rs
+              << " rt=0x" << rt << " rd=0x" << rd << " ins=0x"
+              << ins << std::dec << "\n";
+}
+
+
+// Patch the primary table entry for COP0 (opcode 0x10).
+// We do this here so init_decode_tables() doesn't have to know about COP0
+// (but if init_decode_tables() runs again, it will be overridden by it).
+static void ensure_cop0_mapped()
+{
+    // primary_table is defined in Part 6
+    extern instr_func primary_table[];
+    primary_table[0x10] = instr_COP0;
+}
+
+// Make sure COP0 is mapped at CPU construction time.
+// We add a small shim: if init_decode_tables already called, ensure mapping here.
+// If CPU constructor calls init_decode_tables (it does), calling this function
+// again will simply overwrite primary_table[0x10] -> instr_COP0.
+struct _EnsureCOP0Mapped {
+    _EnsureCOP0Mapped() { ensure_cop0_mapped(); }
+} _ensure_cop0_mapped_instance;
+
+
+// -----------------------------------------------------------
+// PART 9 END
+// paste code here in Part 10
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 10 — Full CP0 Exception Flow (EPC, Status, Cause)
+// -----------------------------------------------------------
+//
+// REQUIRED FOR:
+//   • PROM exception jumps
+//   • Early IRIX kernel exception handling
+//   • Proper EPC return with ERET
+//   • Correct EXL handling
+//
+// This implements:
+//   CPU::enter_exception()
+//   CPU::raise_exception()
+//   CP0 Status / Cause updates
+//
+// -----------------------------------------------------------
+
+
+// -----------------------------------------------------------
+// Helper: push CPU into exception state
+// -----------------------------------------------------------
+void CPU::enter_exception(int code, uint64_t badPC)
+{
+    if (!cp0) {
+        std::cerr << "[CPU] enter_exception() but CP0 missing\n";
+        return;
+    }
+
+    // Read status, cause, epc from CP0
+    uint64_t status = cp0->read_reg(12); // Status
+    uint64_t cause  = cp0->read_reg(13); // Cause
+
+    // -------------------------------------------------------
+    // If EXL is already set, EPC must not be overwritten
+    // -------------------------------------------------------
+    bool exl = (status >> 1) & 1;
+
+    if (!exl) {
+        // First exception → write EPC = PC at exception time
+        cp0->write_reg(14, badPC); // EPC
+    }
+
+    // -------------------------------------------------------
+    // Set EXL = 1 (bit 1)
+    // -------------------------------------------------------
+    status |= (1ULL << 1);
+    cp0->write_reg(12, status);
+
+    // -------------------------------------------------------
+    // Cause.ExcCode = exception code (bits 6..2)
+    // -------------------------------------------------------
+    cause &= ~0x7C;           // Clear ExcCode field
+    cause |= ((code & 0x1F) << 2);
+    cp0->write_reg(13, cause);
+
+    // -------------------------------------------------------
+    // Jump to exception vector:
+    // PROM uses: 0x1FC00380
+    // IRIX kernel uses BEV=0 bit to choose different vector
+    // -------------------------------------------------------
+    uint64_t vector = 0x1FC00380;
+
+    // If BEV bit (Status bit 22) is set → use alternate vector
+    if (status & (1ULL << 22)) {
+        vector = 0x1FC00000;  // Boot exception vector
+    }
+
+    pc     = vector;
+    nextPC = vector + 4;
+}
+
+
+// -----------------------------------------------------------
+// Wrapper: raise an exception by code
+// -----------------------------------------------------------
+void CPU::raise_exception(int code)
+{
+    enter_exception(code, pc);
+}
+
+
+// -----------------------------------------------------------
+// CP0 integrated raise_exception for SYSCALL/BREAK/address errors
+// -----------------------------------------------------------
+
+void CPU::raise_syscall()
+{
+    raise_exception(8); // ExcCode 8 = Syscall
+}
+
+void CPU::raise_break()
+{
+    raise_exception(9); // ExcCode 9 = Breakpoint
+}
+
+void CPU::address_error()
+{
+    raise_exception(4); // ExcCode 4 = Address error (load)
+}
+
+
+// -----------------------------------------------------------
+// PART 10 END
+// paste code here in Part 11
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 11 — TLB Operations (TLBR, TLBWI, TLBWR, TLBP)
+// -----------------------------------------------------------
+//
+// Implements all CP0 TLB instructions needed by IRIX:
+//
+//   • TLBR  – read indexed TLB entry into CP0 registers
+//   • TLBWI – write CP0 registers into TLB at Index
+//   • TLBWR – write CP0 registers into TLB at Random
+//   • TLBP  – probe TLB for matching entry and set Index
+//
+// MMU performs actual address translation.
+// CPU triggers TLB refill exceptions here when necessary.
+//
+// -----------------------------------------------------------
+
+
+// The COP0 opcode for all TLB ops: 0x10 with rs = 0x10, funct field decides.
+//
+// Encoding:
+//   opcode = 0x10
+//   rs     = 0x10
+//   funct:
+//       0x01 = TLBR
+//       0x02 = TLBWI
+//       0x06 = TLBWR
+//       0x08 = TLBP
+//
+// IRIX kernel uses all four during boot.
+// -----------------------------------------------------------
+
+
+static void instr_TLBR(CPU* c)
+{
+    if (!c->mmu || !c->cp0) {
+        std::cerr << "[CPU] TLBR but MMU/CP0 missing\n";
+        return;
+    }
+    c->mmu->tlbr(c->cp0); // read TLB into CP0.EntryHi/EntryLo registers
+}
+
+static void instr_TLBWI(CPU* c)
+{
+    if (!c->mmu || !c->cp0) {
+        std::cerr << "[CPU] TLBWI but MMU/CP0 missing\n";
+        return;
+    }
+    c->mmu->tlbwi(c->cp0); // write CP0.EntryHi/EntryLo into TLB index
+}
+
+static void instr_TLBWR(CPU* c)
+{
+    if (!c->mmu || !c->cp0) {
+        std::cerr << "[CPU] TLBWR but MMU/CP0 missing\n";
+        return;
+    }
+    c->mmu->tlbwr(c->cp0); // write CP0.EntryHi/EntryLo into TLB random slot
+}
+
+static void instr_TLBP(CPU* c)
+{
+    if (!c->mmu || !c->cp0) {
+        std::cerr << "[CPU] TLBP but MMU/CP0 missing\n";
+        return;
+    }
+    c->mmu->tlbp(c->cp0); // probe TLB and set Index
+}
+
+
+// -----------------------------------------------------------
+// Extend COP0 handler to include TLB ops
+// -----------------------------------------------------------
+static void instr_COP0_extended(CPU* c, uint32_t ins)
+{
+    uint32_t rs = RS(ins);
+    uint32_t funct = FUNCT(ins);
+
+    // TLB operations: rs=0x10 (COP0 TLB function group)
+    if (rs == 0x10)
+    {
+        switch (funct)
+        {
+            case 0x01: instr_TLBR(c);  return;
+            case 0x02: instr_TLBWI(c); return;
+            case 0x06: instr_TLBWR(c); return;
+            case 0x08: instr_TLBP(c);  return;
+        }
+    }
+
+    // Otherwise fall back to regular COP0 logic (MFC0/MTC0/ERET)
+    instr_COP0(c, ins);
+}
+
+
+// -----------------------------------------------------------
+// Hook extended COP0 handler into primary opcode table
+// -----------------------------------------------------------
+static void ensure_cop0_extended()
+{
+    extern instr_func primary_table[];
+    primary_table[0x10] = instr_COP0_extended;
+}
+
+// Auto-run mapping on startup
+struct _EnsureCOP0Ext {
+    _EnsureCOP0Ext() { ensure_cop0_extended(); }
+} _ensure_cop0extended_instance;
+
+
+
+// -----------------------------------------------------------
+// TLB Refill Exception Trigger Helpers
+// -----------------------------------------------------------
+//
+// These are called by mmu when accessing unmapped addresses.
+// CPU must enter exception vector TLBL or TLBS.
+//
+// IRIX expects:
+//   TLBL = 2
+//   TLBS = 3
+// -----------------------------------------------------------
+
+void CPU::raise_tlbl(uint64_t addr)
+{
+    // BadVAddr = the address that caused fault
+    if (cp0) cp0->write_reg(8, addr);
+
+    raise_exception(2); // TLBL
+}
+
+void CPU::raise_tlbs(uint64_t addr)
+{
+    if (cp0) cp0->write_reg(8, addr);
+
+    raise_exception(3); // TLBS
+}
+
+
+// -----------------------------------------------------------
+// PART 11 END
+// paste code here in Part 12
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 12 — CPU <-> MMU Glue (Address Translation, Segments)
+// -----------------------------------------------------------
+//
+// This part defines:
+//   • CPU::mmu_read8/16/32 and mmu_write8/16/32
+//   • Segment rules (KUSEG/KSEG0/KSEG1/KSEG2)
+//   • Hooks for TLB exceptions (TLBL/TLBS)
+//   • Integration with Part 11's TLB refill exception helpers
+//
+// IRIX heavily depends on correct segment layout:
+//
+//   0x00000000 - 0x7FFFFFFF   KUSEG   (TLB mapped, user mode)
+//   0x80000000 - 0x9FFFFFFF   KSEG0   (mapped, cached, direct phys)
+//   0xA0000000 - 0xBFFFFFFF   KSEG1   (mapped, uncached, direct phys)
+//   0xC0000000 - 0xFFFFFFFF   KSEG2   (TLB mapped, kernel mode)
+//
+// The PROM (IP30) always lives in KSEG1 unmapped region.
+//
+// -----------------------------------------------------------
+
+
+// -----------------------------------------------------------
+// Convert virtual → physical addressing
+//   This calls mmu->translate() but also handles KSEG0/KSEG1
+// -----------------------------------------------------------
+bool CPU::translate_address(uint64_t vaddr, uint64_t& paddr, bool write)
+{
+    // KSEG0: 0x80000000 - 0x9FFFFFFF  → direct physical, cached
+    if (vaddr >= 0x80000000ULL && vaddr <= 0x9FFFFFFFULL)
+    {
+        paddr = vaddr - 0x80000000ULL;
+        return true;
+    }
+
+    // KSEG1: 0xA0000000 - 0xBFFFFFFF  → direct physical, uncached
+    if (vaddr >= 0xA0000000ULL && vaddr <= 0xBFFFFFFFULL)
+    {
+        paddr = vaddr - 0xA0000000ULL;
+        return true;
+    }
+
+    // Otherwise use MMU TLB translation
+    if (!mmu)
+    {
+        std::cerr << "[CPU] MMU missing for mapped address\n";
+        return false;
+    }
+
+    int res = mmu->translate(vaddr, paddr, write);
+
+    // TLB MISS
+    if (res == MMU::TLB_MISS)
+    {
+        if (write)
+            raise_tlbs(vaddr);
+        else
+            raise_tlbl(vaddr);
+        return false;
+    }
+
+    // TLB INVALID
+    if (res == MMU::TLB_INVALID)
+    {
+        if (write)
+            raise_tlbs(vaddr);
+        else
+            raise_tlbl(vaddr);
+        return false;
+    }
+
+    // TLB OK
+    return true;
+}
+
+
+// -----------------------------------------------------------
+// CPU-side MMU read/write helpers
+// -----------------------------------------------------------
+
+uint8_t CPU::mmu_read8(uint64_t vaddr)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, false))
+        return 0;
+
+    return memory->read8(paddr);
+}
+
+uint16_t CPU::mmu_read16(uint64_t vaddr)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, false))
+        return 0;
+
+    return memory->read16(paddr);
+}
+
+uint32_t CPU::mmu_read32(uint64_t vaddr)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, false))
+        return 0;
+
+    return memory->read32(paddr);
+}
+
+
+void CPU::mmu_write8(uint64_t vaddr, uint8_t val)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, true))
+        return;
+
+    memory->write8(paddr, val);
+}
+
+void CPU::mmu_write16(uint64_t vaddr, uint16_t val)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, true))
+        return;
+
+    memory->write16(paddr, val);
+}
+
+void CPU::mmu_write32(uint64_t vaddr, uint32_t val)
+{
+    uint64_t paddr;
+    if (!translate_address(vaddr, paddr, true))
+        return;
+
+    memory->write32(paddr, val);
+}
+
+
+// -----------------------------------------------------------
+// Override load/store helpers from earlier parts
+// -----------------------------------------------------------
+uint32_t CPU::load32_be(uint64_t addr)
+{
+    uint32_t v = mmu_read32(addr);
+    return __builtin_bswap32(v);
+}
+
+uint16_t CPU::load16_be(uint64_t addr)
+{
+    uint16_t v = mmu_read16(addr);
+    return __builtin_bswap16(v);
+}
+
+uint8_t CPU::load8(uint64_t addr)
+{
+    return mmu_read8(addr);
+}
+
+void CPU::store32_be(uint64_t addr, uint32_t val)
+{
+    mmu_write32(addr, __builtin_bswap32(val));
+}
+
+void CPU::store16_be(uint64_t addr, uint16_t val)
+{
+    mmu_write16(addr, __builtin_bswap16(val));
+}
+
+void CPU::store8(uint64_t addr, uint8_t val)
+{
+    mmu_write8(addr, val);
+}
+
+
+// -----------------------------------------------------------
+// PART 12 END
+// paste code here in Part 13
+// -----------------------------------------------------------
+// -----------------------------------------------------------
+// cpu.cpp (Racer SGI Octane Emulator)
+// Part 13 — Final plumbing: memory attach, run loop, logging
+// -----------------------------------------------------------
+//
+// This final part completes the CPU implementation by:
+//  - providing attach_memory()
+//  - providing a convenience connect_all()
+//  - implementing run() loop
+//  - adding debug dump functions
+//  - safety checks and destructor
+//
+// Logs use the emulator name "Racer" (not "Speedracer").
+// -----------------------------------------------------------
+
+#include "memory.h"
+
+// -----------------------------------------------------------
+// Attach Memory pointer (used by MMU glue in Part 12)
+// -----------------------------------------------------------
+void CPU::attach_memory(Memory* m)
+{
+    memory = m;
+}
+
+// -----------------------------------------------------------
+// Convenience: attach all subsystems at once
+// Emulator should call this when wiring components.
+// -----------------------------------------------------------
+void CPU::connect_all(MMU* m, CP0* c, Memory* memptr)
+{
+    mmu = m;
+    cp0 = c;
+    memory = memptr;
+
+    // Ensure CP0 and MMU are aware of CPU where needed
+    if (cp0) cp0->attach_cpu(this);
+
+    // Initialize decode tables if not already done
+    init_decode_tables();
+}
+
+// -----------------------------------------------------------
+// CPU run loop: run 'n' instructions (or until halted)
+// Uses step_with_exceptions() which handles MUL/DIV timing.
+// -----------------------------------------------------------
+void CPU::run(uint64_t instr_count)
+{
+    std::cout << "[Racer][CPU] Starting run: " << instr_count << " instructions\n";
+    for (uint64_t i = 0; i < instr_count; ++i)
+    {
+        step_with_exceptions();
+
+        // Optional: allow external break/halt points in future
+        if (halted) {
+            std::cout << "[Racer][CPU] halted at PC=0x" << std::hex << pc << std::dec << "\n";
+            break;
+        }
+    }
+    std::cout << "[Racer][CPU] Run complete. cycles=" << cycles << "\n";
+}
+
+// -----------------------------------------------------------
+// Debug helpers
+// -----------------------------------------------------------
+void CPU::dump_regs()
+{
+    std::cout << "[Racer][CPU] Register file dump:\n";
+    for (int i = 0; i < 32; i += 4)
+    {
+        printf("r%02d: 0x%016llx  r%02d: 0x%016llx  r%02d: 0x%016llx  r%02d: 0x%016llx\n",
+               i,  (unsigned long long)regs[i],
+               i+1,(unsigned long long)regs[i+1],
+               i+2,(unsigned long long)regs[i+2],
+               i+3,(unsigned long long)regs[i+3]);
+    }
+    std::cout << "HI: 0x" << std::hex << hi << "  LO: 0x" << lo << std::dec << "\n";
+    std::cout << "PC: 0x" << std::hex << pc << "  nextPC: 0x" << nextPC << std::dec << "\n";
+}
+
+void CPU::dump_state()
+{
+    std::cout << "[Racer][CPU] State dump:\n";
+    dump_regs();
+    if (cp0) {
+        std::cout << "[Racer][CPU] CP0 registers (partial):\n";
+        std::cout << " Status: 0x" << std::hex << cp0->read_reg(12) << std::dec << "\n";
+        std::cout << " Cause : 0x" << std::hex << cp0->read_reg(13) << std::dec << "\n";
+        std::cout << " EPC   : 0x" << std::hex << cp0->read_reg(14) << std::dec << "\n";
+    } else {
+        std::cout << "[Racer][CPU] CP0 not attached\n";
+    }
+}
+
+// -----------------------------------------------------------
+// Destructor
+// -----------------------------------------------------------
+CPU::~CPU()
+{
+    // Nothing to free; owned resources are managed by Emulator
+}
+
+// -----------------------------------------------------------
+// Final marker for CPU file assembly
+// -----------------------------------------------------------
+ // paste code here in Part 14
+
